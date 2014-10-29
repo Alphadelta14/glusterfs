@@ -570,6 +570,7 @@ pub_glfs_new (const char *volname)
 
 	pthread_mutex_init (&fs->mutex, NULL);
 	pthread_cond_init (&fs->cond, NULL);
+        pthread_cond_init (&fs->child_down_cond, NULL);
 
 	INIT_LIST_HEAD (&fs->openfds);
 
@@ -577,6 +578,48 @@ pub_glfs_new (const char *volname)
 }
 
 GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_new, 3.4.0);
+
+
+struct glfs *
+priv_glfs_new_from_ctx (glusterfs_ctx_t *ctx)
+{
+        struct glfs    *fs = NULL;
+
+        if (!ctx)
+                return NULL;
+
+        fs = GF_CALLOC (1, sizeof (*fs), glfs_mt_glfs_t);
+        if (!fs)
+                return NULL;
+        fs->ctx = ctx;
+
+        (void) pthread_cond_init (&fs->cond, NULL);
+
+        (void) pthread_mutex_init (&fs->mutex, NULL);
+
+        INIT_LIST_HEAD (&fs->openfds);
+
+        return fs;
+}
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_new_from_ctx, 3.7.0);
+
+
+void
+priv_glfs_free_from_ctx (struct glfs *fs)
+{
+        if (!fs)
+                return;
+
+        (void) pthread_cond_destroy (&fs->cond);
+        (void) pthread_cond_destroy (&fs->child_down_cond);
+
+        (void) pthread_mutex_destroy (&fs->mutex);
+
+        GF_FREE (fs);
+}
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_free_from_ctx, 3.7.0);
 
 
 int
@@ -754,15 +797,16 @@ GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_init, 3.4.0);
 int
 pub_glfs_fini (struct glfs *fs)
 {
-        int             ret = -1;
-        int             countdown = 100;
-        xlator_t        *subvol = NULL;
-        glusterfs_ctx_t *ctx = NULL;
-        call_pool_t     *call_pool = NULL;
-        int             fs_init = 0;
+        int                ret = -1;
+        int                countdown = 100;
+        xlator_t           *subvol = NULL;
+        glusterfs_ctx_t    *ctx = NULL;
+        glusterfs_graph_t  *graph = NULL;
+        call_pool_t        *call_pool = NULL;
+        int                fs_init = 0;
+        int                err = -1;
 
         ctx = fs->ctx;
-
         if (ctx->mgmt) {
                 rpc_clnt_disable (ctx->mgmt);
                 ctx->mgmt = NULL;
@@ -793,24 +837,55 @@ pub_glfs_fini (struct glfs *fs)
         if (fs_init != 0) {
                 subvol = glfs_active_subvol (fs);
                 if (subvol) {
-                        /* PARENT_DOWN within priv_glfs_subvol_done() is issued only
-                           on graph switch (new graph should activiate and
-                           decrement the extra @winds count taken in glfs_graph_setup()
+                        /* PARENT_DOWN within glfs_subvol_done() is issued
+                           only on graph switch (new graph should activiate
+                           and decrement the extra @winds count taken in
+                           glfs_graph_setup()
 
-                           Since we are explicitly destroying, PARENT_DOWN is necessary
+                           Since we are explicitly destroying,
+                           PARENT_DOWN is necessary
                         */
                         xlator_notify (subvol, GF_EVENT_PARENT_DOWN, subvol, 0);
-                        /* TBD: wait for CHILD_DOWN before exiting, in case of
-                           asynchronous cleanup like graceful socket
-                           disconnection in the future.
+                        /* Here we wait for GF_EVENT_CHILD_DOWN before exiting,
+                           in case of asynchrnous cleanup
                         */
+                        graph = subvol->graph;
+                        err = pthread_mutex_lock (&fs->mutex);
+                        if (err != 0) {
+                                gf_log ("glfs", GF_LOG_ERROR,
+                                        "pthread lock on glfs mutex, "
+                                        "returned error: (%s)", strerror (err));
+                                goto fail;
+                        }
+                        /* check and wait for CHILD_DOWN for active subvol*/
+                        {
+                                while (graph->used) {
+                                        err = pthread_cond_wait (&fs->child_down_cond,
+                                                                 &fs->mutex);
+                                        if (err != 0)
+                                                gf_log ("glfs", GF_LOG_INFO,
+                                                        "%s cond wait failed %s",
+                                                        subvol->name,
+                                                        strerror (err));
+                                }
+                        }
+
+                        err = pthread_mutex_unlock (&fs->mutex);
+                        if (err != 0) {
+                                gf_log ("glfs", GF_LOG_ERROR,
+                                        "pthread unlock on glfs mutex, "
+                                        "returned error: (%s)", strerror (err));
+                                goto fail;
+                        }
                 }
                 glfs_subvol_done (fs, subvol);
         }
 
         if (gf_log_fini(ctx) != 0)
                 ret = -1;
-
+fail:
+        if (!ret)
+                ret = err;
         return ret;
 }
 
